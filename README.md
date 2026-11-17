@@ -128,26 +128,7 @@ cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
 cmake --build build --config Release
 ```
 
-## Validation and test evidence
-
-### Standalone installation smoke test
-
-The clean-copy installation procedure has been verified in a separate folder
-without reusing the native build output:
-
-```text
-fmmm-gpu-install-check/build-clean/planar_cuda_refactored.pyd
-status: OK
-valid: True
-exact_valid: True
-K: 0
-edge_crossings: [0]
-```
-
-The test graph contains two nodes and one edge. This is an installation and
-API smoke test, not a quality or performance benchmark.
-
-### Result contract
+## Result contract
 
 An accepted result is expected to contain:
 
@@ -162,7 +143,7 @@ Invalid inputs and rejected layouts are represented as structured records;
 callers should not silently repair a rejected layout and then label it as an
 FMMM result.
 
-### Timing semantics
+## Timing semantics
 
 Timing fields must be interpreted with their seam. `layout_ms` is intended to
 measure the layout schedule that produces coordinates. GPU admission,
@@ -170,10 +151,11 @@ geometry validation, exhaustive recount, and bounded result transfer are
 reported as separate work when the surrounding experiment protocol records
 them. Including scoring inside a layout timer answers a different question.
 
-This repository currently makes no universal speedup, throughput, or global
-layout-quality claim. Any future benchmark must freeze the graph corpus,
-seed, FMMM profile, CUDA architecture, compiler, warm-up policy, and timing
-boundaries, and must publish the corresponding raw manifests.
+The performance tables at the end of this README are a labelled research
+snapshot from the accompanying paper/report. They are not a promise that every
+fresh checkout reproduces the same numbers. Any new benchmark must freeze the
+graph corpus, seed, FMMM profile, CUDA architecture, compiler, warm-up policy,
+and timing boundaries, and must publish the corresponding raw manifests.
 
 ## Current qualification boundary
 
@@ -201,6 +183,108 @@ CMakeLists.txt              generator-based build configuration
 requirements.txt            build dependency
 EXTRACTION_MANIFEST.md      source boundary and provenance notes
 ```
+
+## Performance evidence from the paper/report
+
+The following tables come from the FMMM sections of the GPU engineering paper
+and its measurement reports. They are included to make the performance story
+visible to users of this standalone repository. The measurements are labelled
+`REFERENCE_ONLY` / `ORIENTATION`, not as a protocol-identical reproduction of
+the original paper or as a guarantee for all hardware.
+
+### Hardware and timing protocol
+
+- NVIDIA GeForce RTX 4060 Laptop GPU, 8,188 MiB, driver 581.57
+- Native Windows measurement environment for the post-fusion sweep
+- Python 3.11, CUDA 13.0, MSVC 2022, Ada `sm_89`
+- Five warm repetitions after one labelled warm-up for the selected tables
+- FMMM layout timing excludes post-timing geometry admission and exhaustive
+  scoring; those gates are checked after the timed layout region
+- `layout_ms` is layout latency; `device_ms` is the device-side layout event
+- Batch throughput is layouts/second and must not be substituted for
+  single-layout latency
+
+### A10 NMM launch fusion
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| NMM-related kernel instances/call | ~2,125 | ~205 |
+| `cudaLaunchKernel`/call | ~2,270 | ~349 |
+| Warm layout latency (ms) | 25.437 | 2.802 |
+| Warm device time (ms) | 21.733 | 2.453 |
+
+This is the main optimization story: the FMMM path was launch-bound, so
+reducing launch/control-plane overhead mattered more than only tuning one force
+kernel.
+
+```mermaid
+xychart-beta
+    title "Automatic-10 warm layout latency"
+    x-axis [Before, After]
+    y-axis "milliseconds" 0 --> 28
+    bar [25.437, 2.802]
+```
+
+### Single-layout CPU/CUDA comparison
+
+| Instance | Nodes/edges | CPU (ms) | CUDA warm (ms) | Reported speedup |
+| --- | ---: | ---: | ---: | ---: |
+| Automatic-1 | 24/27 | 37.132 | 15.175 | 2.45× |
+| Automatic-10 | 180/716 | 59.940 | 6.678 | 8.98× |
+| Automatic-13 | 1,936/3,531 | 453.855 | 84.141 | 5.39× |
+
+These are selected official inputs from the paper/report protocol. The numbers
+must be read with the stated environment and timing seam; they are not a
+claim of universal CUDA speedup.
+
+### Post-fusion Automatic-1..15 layout latency
+
+| Instance | Nodes | Edges | `layout_ms` | `device_ms` |
+| --- | ---: | ---: | ---: | ---: |
+| Automatic-1 | 24 | 27 | 0.647 | 0.384 |
+| Automatic-2 | 56 | 102 | 0.515 | 0.340 |
+| Automatic-3 | 15 | 50 | 0.386 | 0.274 |
+| Automatic-4 | 16 | 71 | 0.483 | 0.306 |
+| Automatic-5 | 21 | 71 | 0.574 | 0.331 |
+| Automatic-6 | 68 | 138 | 0.597 | 0.413 |
+| Automatic-7 | 156 | 219 | 0.963 | 0.732 |
+| Automatic-8 | 75 | 153 | 0.640 | 0.474 |
+| Automatic-9 | 1,024 | 1,984 | 7.042 | 6.223 |
+| Automatic-10 | 180 | 716 | 2.667 | 2.435 |
+| Automatic-11 | 967 | 1,872 | 6.975 | 5.666 |
+| Automatic-12 | 246 | 1,201 | 3.199 | 2.808 |
+| Automatic-13 | 1,936 | 3,531 | 11.779 | 10.765 |
+| Automatic-14 | 300 | 5,250 | 5.785 | 5.322 |
+| Automatic-15 | 4,704 | 9,200 | 37.398 | 35.435 |
+
+The table shows the measured scaling trend for this corpus: larger graphs and
+deeper multipole work generally require more layout time, but these points do
+not establish a closed-form complexity model.
+
+### Automatic-10 multi-layout throughput
+
+| Batch size `B` | CPU layouts/s | CUDA layouts/s | Batch speedup |
+| ---: | ---: | ---: | ---: |
+| 2 | 6.93 | 58.43 | 8.44× |
+| 4 | 6.37 | 99.07 | 15.56× |
+| 8 | 6.96 | 255.48 | 36.68× |
+
+Batch speedup reflects amortization and device-side batching. It is a
+throughput experiment, not a single-layout latency result. The report defines
+the CPU baseline as sequential OGDF calls and the CUDA side as one batched
+invocation under that experiment's implementation and measurement boundary.
+
+### Source reports
+
+- `v0_fmmm_timing_seam.md`: timing boundary and A1/A10/A13 comparison
+- `v0_fmmm_paper_table12_remasure.md`: paper Table 1/2 orientation report
+- `v0_fmmm_nmm_launch_fuse_merge.md`: NMM launch-fusion measurement
+- `v0_fmmm_a1_a15_after_nmm_fuse.md`: A1–A15 post-fusion sweep
+
+The standalone repository intentionally publishes the summary tables rather
+than copying the entire parent project's experiment archive. The raw source
+reports and manifests remain in the research repository and should be used for
+full reproduction or audit.
 
 ## License
 
