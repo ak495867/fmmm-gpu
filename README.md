@@ -1,46 +1,71 @@
 # fmmm-gpu
 
-Standalone CUDA FMMM layout seed engine extracted from the GPU_LCN research
-repository. It accepts a graph and initial coordinates from Python, runs the
-GPU FMMM pipeline, and returns a publication record containing coordinates,
-status, timing, and GPU-recounted score data.
+Standalone CUDA implementation of an FMMM-inspired graph-layout seed engine
+with a small Python API. The project accepts a graph and initial coordinates,
+runs the GPU layout path, performs GPU-side geometry admission and scoring,
+and returns a provenance-carrying publication record.
 
-This repository is deliberately limited to the FMMM layout stage. PTS, PDS,
-SharedSA, campaign scheduling, LCN orchestration, seminar material, and
-research artifacts stay in the parent project and are not runtime dependencies.
+This repository contains the layout stage only. PTS, PDS, SharedSA, campaign
+scheduling, LCN application orchestration, seminar material, and experiment
+artifacts remain outside this repository.
 
-## Current qualification boundary
+## Acknowledgements and provenance
 
-The current implementation is the existing `fmmm-gpu` seed path qualified for
-the declared CUDA envelope. It is not a claim of OGDF coordinate parity,
-global optimality, or support for every GPU architecture. The initial build
-target is Windows + CUDA + Python 3.11+ + pybind11 + `sm_89`, matching the
-source project; architecture and packaging generalization should be a separate
-release step.
+This project is grateful to the authors of the Fast Multipole Multilevel
+Method (FMMM/FM3), especially:
 
-## Build
+> Stefan Hachul and Michael Jünger, “Drawing Large Graphs with a
+> Potential-Field-Based Multilevel Algorithm,” Graph Drawing 2004.
 
-From a Developer PowerShell with CUDA `nvcc` on `PATH`:
+- [Paper and publication record](https://doi.org/10.1007/978-3-540-31843-9_29)
+- [Open-access paper copy](https://kups.ub.uni-koeln.de/54877/1/zaik2004-472.pdf)
+- [OGDF repository](https://github.com/ogdf/ogdf)
+- [OGDF FMMMLayout documentation](https://ogdf.github.io/doc/ogdf/classogdf_1_1_f_m_m_m_layout.html)
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\python -m pip install --upgrade pip pybind11
-cmake -S . -B build -G Ninja -DFMMM_PYTHON_EXECUTABLE="$((Resolve-Path .\.venv\Scripts\python.exe).Path)"
-cmake --build build --config Release
+The paper provides the mathematical and algorithmic foundation for the
+multilevel force-directed method and its potential-field/multipole ideas. The
+OGDF implementation is used as a reference for algorithm structure, options,
+and comparison behavior. The CUDA implementation in this repository is our
+own GPU-oriented reimplementation and adaptation; it is not a claim of
+binary-identical OGDF behavior and does not redistribute the OGDF source tree.
+
+The comparison work uses the pinned OGDF reference profile
+`ogdf-foxglove-202510` at commit
+`5b6795655399b9d8e2921afec9d97bab9107d5ee`. OGDF is an optional comparison
+reference, not a runtime dependency of the Python CUDA extension.
+
+## Data and execution flow
+
+```text
+Python graph input
+        |
+        v
+Input normalization and boundary checks
+        |
+        v
+Host -> GPU graph upload
+        |
+        v
+GPU FMMM-inspired layout path
+  hierarchy / coarsening
+  placement / force evaluation
+  Barnes-Hut or NMM-style device work
+  uncoarsening / coordinate publication
+        |
+        v
+GPU geometry admission and FULL_SQUARE_GPU recount
+        |
+        v
+Python publication record
+  status / coordinates / score / timing / provenance
 ```
 
-For the cleanest Windows build path, the repository also provides a direct
-single-invocation NVCC script. It avoids generator-specific custom-command
-behavior:
+The GPU admission and recount are part of the trust boundary. A layout is not
+reported as accepted merely because the force loop produced coordinates. The
+returned score contains the lexicographic objective `(K, nK, Phi, C)` together
+with edge-crossing counts and validity fields.
 
-```powershell
-.\build.ps1 -Python ..\.venv\Scripts\python.exe
-```
-
-This writes the extension to `build-clean\planar_cuda_refactored.pyd`.
-
-The resulting `planar_cuda_refactored.pyd` is the native extension. The Python
-facade can then be used with `PYTHONPATH=python;build\Release`:
+## Python API
 
 ```python
 from fmmm_gpu import seed_layout
@@ -51,36 +76,137 @@ result = seed_layout(
     width=100,
     height=100,
     seed=7,
+    iterations=3,
 )
-print(result["status"], result["coordinates"], result["score"])
+
+print(result["status"])
+print(result["coordinates"])
+print(result["score"])
 ```
+
+The public facade intentionally exposes only `seed_layout` and hides the
+native extension loading details. The native module is currently named
+`planar_cuda_refactored` for ABI compatibility with the source project.
 
 ## Requirements
 
-- Windows 10/11 with Visual Studio C++ build tools
-- NVIDIA CUDA Toolkit 13.0 or a compatible CUDA 12/13 toolchain with `nvcc`
-- NVIDIA GPU with the configured `sm_89` target, or a deliberately changed
-  `-Architecture`/`FMMM_CUDA_ARCHITECTURES` value for another device
+- Windows 10/11
+- Visual Studio 2022 C++ build tools
+- NVIDIA CUDA Toolkit 13.0, or a compatible CUDA 12/13 installation with
+  `nvcc`
+- NVIDIA GPU; the initial qualified target is Ada `sm_89`
 - Python 3.11 or newer
-- `pybind11` from `requirements.txt`
+- `pybind11` from [requirements.txt](requirements.txt)
 
-Install the Python build dependency with:
+The build is currently qualified on Windows with Python 3.11, CUDA 13.0,
+MSVC 2022, and an RTX 4060 Laptop GPU. Other architectures may work after
+changing the architecture setting, but they are not covered by the current
+qualification statement.
+
+## Build from a clean checkout
+
+From a Developer PowerShell with `nvcc` available:
 
 ```powershell
+python -m venv .venv
+.\.venv\Scripts\python -m pip install --upgrade pip
 .\.venv\Scripts\python -m pip install -r requirements.txt
+.\build.ps1 -Python .\.venv\Scripts\python.exe
 ```
 
-## Extraction notes
+The direct build script performs one explicit NVCC invocation and writes the
+native extension to `build-clean\planar_cuda_refactored.pyd`. It also places
+NVCC temporary files under the ignored `build-clean\nvcc-tmp` directory so
+that compiler-generated files do not depend on a system temporary path.
 
-The CUDA source is copied from the parent project at the extraction point; the
-original research repository remains the provenance source. `resident_api.cu`
-still contains a few legacy compatibility bindings in the native translation
-unit, but the standalone Python facade exposes only the FMMM seed operation.
-The next cleanup step is to split that translation unit into an FMMM-only
-binding and move unrelated compatibility exports out of this repository.
+The CMake configuration is retained for users who prefer a generator-based
+workflow:
 
-## License and redistribution
+```powershell
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+  -DFMMM_PYTHON_EXECUTABLE="$((Resolve-Path .\.venv\Scripts\python.exe).Path)"
+cmake --build build --config Release
+```
 
-This project is released under the MIT License; see [LICENSE](LICENSE).
-Review NVIDIA CUDA and any optional third-party provenance before creating a
-binary redistribution or a release package.
+## Validation and test evidence
+
+### Standalone installation smoke test
+
+The clean-copy installation procedure has been verified in a separate folder
+without reusing the native build output:
+
+```text
+fmmm-gpu-install-check/build-clean/planar_cuda_refactored.pyd
+status: OK
+valid: True
+exact_valid: True
+K: 0
+edge_crossings: [0]
+```
+
+The test graph contains two nodes and one edge. This is an installation and
+API smoke test, not a quality or performance benchmark.
+
+### Result contract
+
+An accepted result is expected to contain:
+
+- `status == "OK"`
+- `coordinates`
+- `score.valid` and `score.exact_valid`
+- `score.K`, `score.nK`, `score.Phi`, and `score.C`
+- `score.edge_crossings`
+- admission/provenance fields supplied by the native publication path
+
+Invalid inputs and rejected layouts are represented as structured records;
+callers should not silently repair a rejected layout and then label it as an
+FMMM result.
+
+### Timing semantics
+
+Timing fields must be interpreted with their seam. `layout_ms` is intended to
+measure the layout schedule that produces coordinates. GPU admission,
+geometry validation, exhaustive recount, and bounded result transfer are
+reported as separate work when the surrounding experiment protocol records
+them. Including scoring inside a layout timer answers a different question.
+
+This repository currently makes no universal speedup, throughput, or global
+layout-quality claim. Any future benchmark must freeze the graph corpus,
+seed, FMMM profile, CUDA architecture, compiler, warm-up policy, and timing
+boundaries, and must publish the corresponding raw manifests.
+
+## Current qualification boundary
+
+The current implementation is a GPU FMMM-inspired seed path with GPU-side
+admission and recount for its declared test envelope. It is not yet a
+formula-by-formula, coordinate-identical OGDF port. Known differences include
+force arithmetic, precision, reduction/order choices, and selected hierarchy
+behavior. Comparisons should therefore report validity and GPU-scored
+objective values under a frozen protocol rather than claiming exact OGDF
+coordinate parity.
+
+The extracted native translation unit still contains a small number of legacy
+compatibility bindings for ABI continuity. The Python facade does not expose
+those unrelated operations; splitting the native binding into an FMMM-only
+translation unit is a planned cleanup.
+
+## Repository layout
+
+```text
+src/cuda_utils/oracle/       GPU graph storage and FULL_SQUARE_GPU authority
+src/cuda_utils/release/      FMMM hierarchy, force, NMM, session, and binding
+python/fmmm_gpu/             public Python facade
+build.ps1                   direct Windows/NVCC build
+CMakeLists.txt              generator-based build configuration
+requirements.txt            build dependency
+EXTRACTION_MANIFEST.md      source boundary and provenance notes
+```
+
+## License
+
+Copyright 2026 Ming-Han Tsai.
+
+This project is licensed under the [Apache License 2.0](LICENSE). OGDF and
+the FMMM paper are acknowledged references; their own licenses and terms
+remain separate and must be reviewed before redistributing any third-party
+material.

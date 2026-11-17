@@ -34,6 +34,7 @@ copied files are compared against that commit.
    current unit still contains legacy compatibility exports even though the
    facade does not expose them.
 2. Add a real test corpus and run GPU build/replay on the supported matrix.
-3. Add a license and third-party provenance notice before public GitHub push.
+3. Keep the Apache-2.0 license and third-party provenance notice synchronized
+   with future source or dependency changes.
 4. Decide whether the public package name should be `fmmm-gpu` or a project
    namespace such as `gpu-fmmm`.
