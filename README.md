@@ -225,7 +225,14 @@ xychart-beta
     bar [25.437, 2.802]
 ```
 
-### Single-layout CPU/CUDA comparison
+### Single-layout OGDF CPU FMMM / CUDA comparison
+
+The CPU column is the FMMM CPU reference produced by the OGDF repository's
+`ogdf::FMMMLayout` implementation. The CUDA column is our GPU-oriented
+reimplementation measured against that OGDF FMMM reference under the stated
+experiment protocol. This is a comparison of layout latency and reported
+speedup; it is not a claim that the CUDA path is the original OGDF binary or
+that coordinates are identical.
 
 | Instance | Nodes/edges | CPU (ms) | CUDA warm (ms) | Reported speedup |
 | --- | ---: | ---: | ---: | ---: |
