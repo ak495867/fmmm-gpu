@@ -1,2 +1,6 @@
-# Python build dependency for the CUDA/pybind11 extension.
+# requirements.txt - Base build and runtime requirements for fmmm-gpu
+#
+# Note: The compiled CUDA extension only strictly requires pybind11 for building.
+# Runtime Python dependencies are zero. For NetworkX and NumPy interop, see
+# requirements-dev.txt or install via: pip install "fmmm-gpu[all]"
 pybind11>=3.0,<4.0

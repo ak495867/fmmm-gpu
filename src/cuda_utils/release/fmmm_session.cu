@@ -1648,6 +1648,15 @@ void fmmm_session_destroy(DeviceFmmmSession& session) {
 #if defined(LCN_FMMM_NATIVE_PHASE_EVENTS)
     fmmm_native_phase_timing_destroy(session);
 #endif
+    // Destroy graph handles before dropping the memory buffers they reference.
+    if (session.schedule_graph_exec != nullptr) {
+        cudaGraphExecDestroy(session.schedule_graph_exec);
+        session.schedule_graph_exec = nullptr;
+    }
+    if (session.schedule_graph != nullptr) {
+        cudaGraphDestroy(session.schedule_graph);
+        session.schedule_graph = nullptr;
+    }
     destroy_timing_events(session);
     release_all_state(session);
     session.workspace.release();
@@ -2060,6 +2069,19 @@ FmmmDeviceStatus fmmm_session_build_nmm(DeviceFmmmSession& session, cudaStream_t
 
 FmmmDeviceStatus fmmm_session_run_schedule(DeviceFmmmSession& session, cudaStream_t stream) {
     if (!session.nmm_built || session.schedule_submitted) return FmmmDeviceStatus::internal_error;
+
+    // Fast-path: replay previously captured CUDA graph for recurring sessions.
+    // Skips the entire kernel dispatch cascade and drops host overhead to zero.
+    if (session.schedule_graph_captured && session.schedule_graph_exec != nullptr) {
+        if (cudaGraphLaunch(session.schedule_graph_exec, stream) != cudaSuccess) {
+            return FmmmDeviceStatus::backend_error;
+        }
+        session.schedule_submitted = true;
+        session.position_epoch = 2;
+        session.box_epoch = 2;
+        return FmmmDeviceStatus::ok;
+    }
+
     const int n = static_cast<int>(session.position_x.valid_elements);
     const int blocks = std::max(1, (n + 127) / 128);
     const int m = static_cast<int>(session.norm_edges_src.valid_elements);
@@ -2068,6 +2090,14 @@ FmmmDeviceStatus fmmm_session_run_schedule(DeviceFmmmSession& session, cudaStrea
         return launch_phase_record(session, phase, FmmmDeviceStatus::ok,
                                    entry, exit, input_count, output_count, stream);
     };
+
+    // If reuse is enabled, capture the schedule kernels into a CUDA graph on first pass.
+    bool capturing = false;
+    if (session.reuse_enabled && !session.schedule_graph_captured && stream != nullptr) {
+        if (cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal) == cudaSuccess) {
+            capturing = true;
+        }
+    }
 
     // placement
     FMMM_NATIVE_PHASE_BEGIN_OR_RETURN(session, FmmmSemanticPhase::placement, stream);
@@ -2201,6 +2231,17 @@ FmmmDeviceStatus fmmm_session_run_schedule(DeviceFmmmSession& session, cudaStrea
     FMMM_NATIVE_PHASE_END_OR_RETURN(session, FmmmSemanticPhase::packing, stream);
     if (!record(kPhasePacking, session.position_epoch, session.box_epoch, n, n))
         return FmmmDeviceStatus::backend_error;
+
+    if (capturing) {
+        if (cudaStreamEndCapture(stream, &session.schedule_graph) == cudaSuccess) {
+            if (cudaGraphInstantiate(&session.schedule_graph_exec, session.schedule_graph, nullptr, nullptr, 0) == cudaSuccess) {
+                session.schedule_graph_captured = true;
+            } else {
+                cudaGraphDestroy(session.schedule_graph);
+                session.schedule_graph = nullptr;
+            }
+        }
+    }
 
     session.schedule_submitted = true;
     session.position_epoch = 2;

@@ -1,16 +1,94 @@
+# pyproject.toml - Packaging manifest for fmmm-gpu
+#
+# We keep core runtime dependencies deliberately empty: the CUDA extension
+# only requires Python and a compatible GPU driver. Heavy frameworks like
+# NumPy, PyTorch, and NetworkX are kept strictly optional under [project.optional-dependencies]
+# so an embedded or lean runtime doesn't have to pull 2GB of PyTorch wheels just to
+# compute node layouts.
+
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=68", "wheel", "pybind11>=3.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "fmmm-gpu"
-version = "0.1.0"
-description = "CUDA FMMM layout seed engine with a small Python API"
-requires-python = ">=3.11"
+version = "0.2.0"
+description = "High-performance CUDA Fast Multipole Multilevel (FMMM) graph layout engine"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+    { name = "FMMM GPU Contributors" }
+]
+keywords = [
+    "graph-drawing",
+    "graph-layout",
+    "fmmm",
+    "cuda",
+    "gpu-acceleration",
+    "force-directed",
+    "multilevel"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "Topic :: Scientific/Engineering :: Visualization",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: C++",
+    "Environment :: GPU :: NVIDIA CUDA",
+]
 dependencies = []
+
+[project.optional-dependencies]
+# Optional graph framework adapters
+networkx = ["networkx>=2.8"]
+numpy = ["numpy>=1.22"]
+torch = ["torch>=2.0"]
+
+# Full interoperability suite
+all = [
+    "networkx>=2.8",
+    "numpy>=1.22",
+    "torch>=2.0",
+]
+
+# Development and testing harness
+test = [
+    "pytest>=8.0",
+    "networkx>=2.8",
+    "numpy>=1.22",
+]
+dev = [
+    "pytest>=8.0",
+    "pybind11>=3.0",
+    "networkx>=2.8",
+    "numpy>=1.22",
+]
+
+[project.urls]
+Homepage = "https://github.com/fmmm-gpu/fmmm-gpu"
+Repository = "https://github.com/fmmm-gpu/fmmm-gpu"
 
 [tool.setuptools]
 package-dir = {"" = "python"}
 
 [tool.setuptools.packages.find]
 where = ["python"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+# Look for tests in tests/ and make sure python/ and build-clean/ are directly
+# on sys.path so tests can import fmmm_gpu and find either compiled .pyd/.so or
+# mock fallbacks without needing a full pip install step first.
+testpaths = ["tests"]
+pythonpath = ["python", "build-clean"]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]

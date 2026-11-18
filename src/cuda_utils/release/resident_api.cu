@@ -26,54 +26,9 @@ namespace py = pybind11;
 namespace lcn::oracle {
 namespace {
 
-struct WorkspaceEstimate {
-    std::uint64_t current_coordinates = 0;
-    std::uint64_t best_coordinates = 0;
-    std::uint64_t scratch_coordinates = 0;
-    std::uint64_t current_counts = 0;
-    std::uint64_t best_counts = 0;
-    std::uint64_t scratch_counts = 0;
-    std::uint64_t metadata = 0;
-    std::uint64_t total = 0;
-};
-
-std::uint64_t checked_add(std::uint64_t a, std::uint64_t b) {
-    if (a > std::numeric_limits<std::uint64_t>::max() - b) throw py::value_error("workspace byte estimate overflow");
-    return a + b;
-}
-std::uint64_t checked_mul(std::uint64_t a, std::uint64_t b) {
-    if (a != 0 && b > std::numeric_limits<std::uint64_t>::max() / a) throw py::value_error("workspace byte estimate overflow");
-    return a * b;
-}
-
-WorkspaceEstimate estimate_workspace(std::uint64_t nodes, std::uint64_t edges, std::uint64_t groups) {
-    // Two int64 coordinate planes per state, three independent states
-    // (current/protected-best/scratch), plus three exact count vectors.
-    const auto coord = checked_mul(checked_mul(groups, nodes), 2U * sizeof(std::int64_t));
-    const auto count = checked_mul(checked_mul(groups, edges), sizeof(std::int64_t));
-    WorkspaceEstimate out;
-    out.current_coordinates = coord; out.best_coordinates = coord; out.scratch_coordinates = coord;
-    out.current_counts = count; out.best_counts = count; out.scratch_counts = count;
-    // temperature, RNG, lineage and three DeviceObjective records per group.
-    out.metadata = checked_mul(groups, 3U * sizeof(DeviceObjective) + 3U * sizeof(std::uint64_t));
-    out.total = checked_add(checked_add(checked_add(out.current_coordinates, out.best_coordinates), out.scratch_coordinates),
-                            checked_add(checked_add(out.current_counts, out.best_counts), checked_add(out.scratch_counts, out.metadata)));
-    return out;
-}
-
-py::dict estimate_dict(const WorkspaceEstimate& item) {
-    py::dict out;
-    out["current_coordinates"] = item.current_coordinates;
-    out["protected_best_coordinates"] = item.best_coordinates;
-    out["scratch_coordinates"] = item.scratch_coordinates;
-    out["current_counts"] = item.current_counts;
-    out["protected_best_counts"] = item.best_counts;
-    out["scratch_counts"] = item.scratch_counts;
-    out["slot_metadata"] = item.metadata;
-    out["total_bytes"] = item.total;
-    return out;
-}
-
+// Host graph parser for Python input tuples.
+// Throws standard pybind exceptions if the tuples are malformed or coordinate
+// values are non-integral for discrete oracle validation.
 GraphSpec parse_graph(const py::iterable& nodes, const py::iterable& edges, std::int64_t width, std::int64_t height) {
     GraphSpec spec; spec.max_width = width; spec.max_height = height;
     for (const py::handle value : nodes) {
@@ -110,98 +65,6 @@ py::dict gpu_identity() {
     out["total_global_memory"] = static_cast<std::uint64_t>(prop.totalGlobalMem);
     return out;
 }
-
-bool objective_less(const py::dict& a, const py::dict& b) {
-    static constexpr const char* fields[] = {"K", "nK", "Phi", "C"};
-    for (const char* key : fields) {
-        const auto av = py::cast<std::int64_t>(a[key]); const auto bv = py::cast<std::int64_t>(b[key]);
-        if (av != bv) return av < bv;
-    }
-    return false;
-}
-
-// Resident evaluator.  One CUDA thread owns one slot/group; deliberately
-// serial per slot for exact, audit-friendly FULL_SQUARE semantics.  It is not
-// a performance kernel, but all proposal generation, acceptance, protected
-// best updates, exchanges and final winner selection are device decisions.
-__device__ inline long long rx(const long long* c, int n, int s, int v) { return c[(2 * s) * n + v]; }
-__device__ inline long long ry(const long long* c, int n, int s, int v) { return c[(2 * s + 1) * n + v]; }
-__device__ inline long long orient_r(long long ax, long long ay, long long bx, long long by, long long cx, long long cy) {
-    return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
-}
-__device__ inline int sign_r(long long a) { return (a > 0) - (a < 0); }
-__device__ inline bool between_r(long long v, long long a, long long b) { return v >= (a < b ? a : b) && v <= (a < b ? b : a); }
-__device__ inline bool on_r(long long px, long long py, long long ax, long long ay, long long bx, long long by) {
-    return orient_r(ax, ay, bx, by, px, py) == 0 && between_r(px, ax, bx) && between_r(py, ay, by);
-}
-__device__ inline bool less_r(const DeviceObjective& a, const DeviceObjective& b) {
-    if (a.K != b.K) return a.K < b.K;
-    if (a.nK != b.nK) return a.nK < b.nK;
-    if (a.Phi != b.Phi) return a.Phi < b.Phi;
-    return a.C < b.C;
-}
-__device__ void score_r(DeviceGraphView g, const long long* c, int slot, int moved, long long mx, long long my,
-                        bool layers, long long* counts, DeviceObjective* out) {
-    const int n = g.node_count, ecount = g.edge_count;
-    auto x = [&](int v) { return v == moved ? mx : rx(c, n, slot, v); };
-    auto y = [&](int v) { return v == moved ? my : ry(c, n, slot, v); };
-    out->valid = out->exact_valid = 0; out->K = out->nK = out->Phi = out->C = 0;
-    out->status = static_cast<int>(ProposalStatus::rejected_invalid); out->fallback_reason = static_cast<int>(FallbackReason::none);
-    if (g.max_width < 2 || g.max_height < 2 || g.max_width > 1000000000LL || g.max_height > 1000000000LL) { out->status = static_cast<int>(ProposalStatus::rejected_overflow); out->fallback_reason = static_cast<int>(FallbackReason::overflow); return; }
-    for (int i = 0; i < n; ++i) {
-        if (x(i) <= 0 || y(i) <= 0 || x(i) >= g.max_width || y(i) >= g.max_height || x(i) > 1000000000LL || y(i) > 1000000000LL) return;
-        for (int j = 0; j < i; ++j) if (x(i) == x(j) && y(i) == y(j)) return;
-    }
-    for (int v = 0; v < n; ++v) for (int e = 0; e < ecount; ++e) { int a = g.source[e], b = g.target[e]; if (v != a && v != b && on_r(x(v), y(v), x(a), y(a), x(b), y(b))) return; }
-    for (int e = 0; e < ecount; ++e) counts[e] = 0;
-    for (int e = 0; e < ecount; ++e) for (int f = e + 1; f < ecount; ++f) {
-        int a = g.source[e], b = g.target[e], d = g.source[f], q = g.target[f];
-        if (a == d || a == q || b == d || b == q || (layers && g.layer[e] != g.layer[f])) continue;
-        long long o1 = orient_r(x(a),y(a),x(b),y(b),x(d),y(d)), o2 = orient_r(x(a),y(a),x(b),y(b),x(q),y(q));
-        long long o3 = orient_r(x(d),y(d),x(q),y(q),x(a),y(a)), o4 = orient_r(x(d),y(d),x(q),y(q),x(b),y(b));
-        if (sign_r(o1) * sign_r(o2) < 0 && sign_r(o3) * sign_r(o4) < 0) { ++counts[e]; ++counts[f]; }
-        else if ((o1 == 0 && on_r(x(d),y(d),x(a),y(a),x(b),y(b))) || (o2 == 0 && on_r(x(q),y(q),x(a),y(a),x(b),y(b))) || (o3 == 0 && on_r(x(a),y(a),x(d),y(d),x(q),y(q))) || (o4 == 0 && on_r(x(b),y(b),x(d),y(d),x(q),y(q)))) return;
-    }
-    long long sum = 0;
-    for (int e = 0; e < ecount; ++e) if (counts[e] > out->K) out->K = counts[e];
-    for (int e = 0; e < ecount; ++e) { if (counts[e] == out->K) ++out->nK; out->Phi += counts[e] * counts[e]; sum += counts[e]; }
-    out->C = sum / 2; out->valid = out->exact_valid = 1; out->status = static_cast<int>(ProposalStatus::initial);
-}
-__global__ void resident_init(DeviceGraphView g, int slots, bool layers, long long* current, long long* best, long long* cur_counts, long long* best_counts, DeviceObjective* cur, DeviceObjective* best_obj, unsigned long long* rng, unsigned long long* lineage) {
-    int s = blockIdx.x * blockDim.x + threadIdx.x; if (s >= slots) return;
-    for (int v=0; v<g.node_count; ++v) { current[(2*s)*g.node_count+v]=g.x[v]; current[(2*s+1)*g.node_count+v]=g.y[v]; best[(2*s)*g.node_count+v]=g.x[v]; best[(2*s+1)*g.node_count+v]=g.y[v]; }
-    score_r(g,current,s,-1,0,0,layers,cur_counts+s*g.edge_count,cur+s); best_obj[s]=cur[s];
-    for(int e=0;e<g.edge_count;++e) best_counts[s*g.edge_count+e]=cur_counts[s*g.edge_count+e]; rng[s]^=0x9e3779b97f4a7c15ULL*(s+1); lineage[s]=s;
-}
-__global__ void resident_step(DeviceGraphView g, int slots, bool layers, long long* current, long long* best, long long* cur_counts, long long* best_counts, long long* scratch, DeviceObjective* cur, DeviceObjective* best_obj, unsigned long long* rng, unsigned long long* lineage) {
-    int s=blockIdx.x*blockDim.x+threadIdx.x; if(s>=slots || g.node_count==0) return; unsigned long long z=rng[s]; z^=z<<13; z^=z>>7; z^=z<<17; rng[s]=z;
-    int v=static_cast<int>(z%static_cast<unsigned long long>(g.node_count)); long long dx=((z>>8)%3)-1, dy=((z>>10)%3)-1; if(dx==0&&dy==0) dx=1;
-    long long mx=rx(current,g.node_count,s,v)+dx, my=ry(current,g.node_count,s,v)+dy; DeviceObjective candidate;
-    score_r(g,current,s,v,mx,my,layers,scratch+s*g.edge_count,&candidate);
-    if(candidate.valid && cur[s].valid && less_r(candidate,cur[s])) { current[(2*s)*g.node_count+v]=mx; current[(2*s+1)*g.node_count+v]=my; cur[s]=candidate; for(int e=0;e<g.edge_count;++e)cur_counts[s*g.edge_count+e]=scratch[s*g.edge_count+e]; ++lineage[s]; if(less_r(cur[s],best_obj[s])) { best_obj[s]=cur[s]; for(int i=0;i<2*g.node_count;++i)best[2*s*g.node_count+i]=current[2*s*g.node_count+i]; for(int e=0;e<g.edge_count;++e)best_counts[s*g.edge_count+e]=cur_counts[s*g.edge_count+e]; } }
-}
-// FlashSA has its own launch boundary and is qualified only in exact mode.
-// Its device state/acceptance deliberately uses the same full-square authority
-// as PTS, rather than a tolerance-based shortcut.
-__global__ void flashsa_exact_step(DeviceGraphView g, int slots, bool layers, long long* current, long long* best, long long* cur_counts, long long* best_counts, long long* scratch, DeviceObjective* cur, DeviceObjective* best_obj, unsigned long long* rng, unsigned long long* lineage) {
-    int s=blockIdx.x*blockDim.x+threadIdx.x;if(s>=slots||g.node_count==0)return;unsigned long long z=rng[s];z^=z<<13;z^=z>>7;z^=z<<17;rng[s]=z;int v=static_cast<int>(z%static_cast<unsigned long long>(g.node_count));long long dx=((z>>8)%3)-1,dy=((z>>10)%3)-1;if(dx==0&&dy==0)dy=1;long long mx=rx(current,g.node_count,s,v)+dx,my=ry(current,g.node_count,s,v)+dy;DeviceObjective candidate;score_r(g,current,s,v,mx,my,layers,scratch+s*g.edge_count,&candidate);if(candidate.valid&&cur[s].valid&&less_r(candidate,cur[s])){current[(2*s)*g.node_count+v]=mx;current[(2*s+1)*g.node_count+v]=my;cur[s]=candidate;for(int e=0;e<g.edge_count;++e)cur_counts[s*g.edge_count+e]=scratch[s*g.edge_count+e];++lineage[s];if(less_r(cur[s],best_obj[s])){best_obj[s]=cur[s];for(int i=0;i<2*g.node_count;++i)best[2*s*g.node_count+i]=current[2*s*g.node_count+i];for(int e=0;e<g.edge_count;++e)best_counts[s*g.edge_count+e]=cur_counts[s*g.edge_count+e];}}
-}
-__global__ void resident_exchange(int slots,int n,int ecount,long long* c,long long* counts,DeviceObjective* obj,unsigned long long* lineage,int parity) { int p=blockIdx.x*blockDim.x+threadIdx.x; int a=2*p+parity,b=a+1;if(b>=slots)return;for(int i=0;i<2*n;++i){long long t=c[2*a*n+i];c[2*a*n+i]=c[2*b*n+i];c[2*b*n+i]=t;}for(int i=0;i<ecount;++i){long long t=counts[a*ecount+i];counts[a*ecount+i]=counts[b*ecount+i];counts[b*ecount+i]=t;}DeviceObjective o=obj[a];obj[a]=obj[b];obj[b]=o;unsigned long long l=lineage[a];lineage[a]=lineage[b];lineage[b]=l; }
-// Independent PDS transaction: W exact candidates are ranked by objective
-// then index, conflicting moved nodes are filtered, the selected moves are
-// applied only to scratch, and one full-square score decides atomic publish.
-__global__ void resident_pds_batch(DeviceGraphView g, bool layers, int width, long long* current, long long* best, long long* cur_counts, long long* best_counts, long long* scratch_coords, long long* scratch_counts, DeviceObjective* cur, DeviceObjective* best_obj, unsigned long long* rng, unsigned long long* lineage) {
-    int s=blockIdx.x; if(threadIdx.x)return; constexpr int kMaxCandidates=32; if(width<1) return; if(width>kMaxCandidates) width=kMaxCandidates;
-    int node[kMaxCandidates], chosen[kMaxCandidates]; long long mx[kMaxCandidates],my[kMaxCandidates]; DeviceObjective candidate[kMaxCandidates]; bool used[kMaxCandidates];
-    for(int i=0;i<2*g.node_count;++i)scratch_coords[2*s*g.node_count+i]=current[2*s*g.node_count+i];
-    unsigned long long z=rng[s];
-    for(int i=0;i<width;++i){z^=z<<13;z^=z>>7;z^=z<<17;node[i]=g.node_count?static_cast<int>(z%static_cast<unsigned long long>(g.node_count)):0;mx[i]=g.node_count?rx(current,g.node_count,s,node[i])+static_cast<long long>((z>>8)%3)-1:0;my[i]=g.node_count?ry(current,g.node_count,s,node[i])+static_cast<long long>((z>>10)%3)-1:0;if(g.node_count&&mx[i]==rx(current,g.node_count,s,node[i])&&my[i]==ry(current,g.node_count,s,node[i]))mx[i]++;score_r(g,current,s,node[i],mx[i],my[i],layers,scratch_counts+s*g.edge_count,&candidate[i]);used[i]=false;}
-    int chosen_count=0;
-    for(int rank=0;rank<width;++rank){int pick=-1;for(int i=0;i<width;++i)if(!used[i]&&candidate[i].valid&&(pick<0||less_r(candidate[i],candidate[pick])||(!less_r(candidate[pick],candidate[i])&&i<pick)))pick=i;if(pick<0)break;used[pick]=true;bool conflict=false;for(int j=0;j<chosen_count;++j)if(chosen[j]==node[pick])conflict=true;if(!conflict){chosen[chosen_count++]=node[pick];scratch_coords[2*s*g.node_count+node[pick]]=mx[pick];scratch_coords[(2*s+1)*g.node_count+node[pick]]=my[pick];}}
-    DeviceObjective final_obj;score_r(g,scratch_coords,s,-1,0,0,layers,scratch_counts+s*g.edge_count,&final_obj);rng[s]=z;
-    if(final_obj.valid&&cur[s].valid&&less_r(final_obj,cur[s])){for(int i=0;i<2*g.node_count;++i)current[2*s*g.node_count+i]=scratch_coords[2*s*g.node_count+i];for(int e=0;e<g.edge_count;++e)cur_counts[s*g.edge_count+e]=scratch_counts[s*g.edge_count+e];cur[s]=final_obj;++lineage[s];if(less_r(cur[s],best_obj[s])){best_obj[s]=cur[s];for(int i=0;i<2*g.node_count;++i)best[2*s*g.node_count+i]=current[2*s*g.node_count+i];for(int e=0;e<g.edge_count;++e)best_counts[s*g.edge_count+e]=cur_counts[s*g.edge_count+e];}}
-}
-__global__ void resident_choose(int slots,const DeviceObjective* best,int* winner){if(threadIdx.x||blockIdx.x)return;int w=0;for(int i=1;i<slots;++i)if(less_r(best[i],best[w]))w=i;*winner=w;}
 
 __device__ inline long long fmmm_candidate_x(DeviceGraphView g, int node, int moved, long long x) {
     return node == moved ? x : g.x[node];
@@ -592,7 +455,6 @@ __global__ void fmmm_coarsest_random_placement_reference(int node_count, unsigne
 // coordinates intervene between the initial seed and exact GPU admission.
 __global__ void fmmm_pair_coarsen(DeviceGraphView graph, float* x, float* y, int coarse_count) { const int coarse=blockIdx.x*blockDim.x+threadIdx.x;if(coarse>=coarse_count)return;const int a=2*coarse,b=a+1;const float bx=b<graph.node_count?static_cast<float>(graph.x[b]):static_cast<float>(graph.x[a]);const float by=b<graph.node_count?static_cast<float>(graph.y[b]):static_cast<float>(graph.y[a]);x[coarse]=(static_cast<float>(graph.x[a])+bx)*0.5F;y[coarse]=(static_cast<float>(graph.y[a])+by)*0.5F; }
 __global__ void fmmm_apply_coarse_force(DeviceGraphView graph,const float* fx,const float* fy) { if(blockIdx.x||threadIdx.x)return;for(int node=0;node<graph.node_count;++node){const int coarse=node/2;const auto nx=graph.x[node]+static_cast<std::int64_t>((fx[coarse]>0.0F)-(fx[coarse]<0.0F));const auto ny=graph.y[node]+static_cast<std::int64_t>((fy[coarse]>0.0F)-(fy[coarse]<0.0F));if(fmmm_candidate_is_valid(graph,node,nx,ny)){graph.x[node]=nx;graph.y[node]=ny;}} }
-__global__ void workspace_digest(const unsigned char* bytes, size_t count, unsigned long long* out) { if(blockIdx.x||threadIdx.x)return; unsigned long long h=1469598103934665603ULL;for(size_t i=0;i<count;++i){h^=bytes[i];h*=1099511628211ULL;}*out=h; }
 
 void fmmm_bh_force(float* position_x, float* position_y, float* force_x, float* force_y, int node_count, const std::int32_t* edge_source=nullptr, const std::int32_t* edge_target=nullptr, int edge_count=0, float* attraction_x=nullptr, float* attraction_y=nullptr) {
     const int capacity=node_count*4+1;
@@ -1825,95 +1687,12 @@ py::list fmmm_run_batch(
     return fmmm_run_batch_multistream(inputs, seed, config, iterations, layers_enabled);
 }
 
-struct ResidentRun { ScoreResult score; std::vector<std::pair<std::int64_t,std::int64_t>> coordinates; std::vector<double> temperatures; std::uint64_t final_bytes=0; std::uint64_t exchanges=0; float timed_ms=0.0F; };
-ResidentRun execute_resident(const GraphSpec& spec, const std::string& engine, std::uint64_t seed, std::uint64_t slots, std::uint64_t steps, std::uint64_t pds_width, bool layers) {
-    if (slots == 0 || slots > 4096) throw py::value_error("replicas/groups must be in 1..4096");
-    DeviceGraph graph(spec); graph.upload(false); const auto estimate=estimate_workspace(graph.node_count(),graph.edge_count(),slots); size_t free_bytes=0,total_bytes=0; cuda_check(cudaMemGetInfo(&free_bytes,&total_bytes),"read device allocation limit"); if(estimate.total>free_bytes) throw py::value_error("resident workspace allocation guard");
-    const size_t coord=static_cast<size_t>(2*slots*graph.node_count()), counts=static_cast<size_t>(slots*graph.edge_count());
-    DeviceBuffer<long long> current(coord),best(coord),scratch_coords(coord),cur_counts(counts),best_counts(counts),scratch(counts); DeviceBuffer<DeviceObjective> cur(slots),best_obj(slots); DeviceBuffer<unsigned long long> rng(slots),lineage(slots); DeviceBuffer<double> temperature(slots); DeviceBuffer<int> winner(1);
-    std::vector<unsigned long long> seeds(slots);std::vector<double> initial_temperature(slots);for(size_t i=0;i<slots;++i){seeds[i]=seed+i;initial_temperature[i]=1.0+static_cast<double>(i)*0.5;} rng.upload(seeds.data(),seeds.size());temperature.upload(initial_temperature.data(),initial_temperature.size());
-    resident_init<<<(slots+127)/128,128>>>(graph.view(),static_cast<int>(slots),layers,current.get(),best.get(),cur_counts.get(),best_counts.get(),cur.get(),best_obj.get(),rng.get(),lineage.get()); cuda_check(cudaGetLastError(),"resident initialization");
-    ResidentRun out; cudaEvent_t start=nullptr,stop=nullptr;cuda_check(cudaEventCreate(&start),"create resident timer");cuda_check(cudaEventCreate(&stop),"create resident timer");cuda_check(cudaEventRecord(start),"start resident timer");for(std::uint64_t step=0;step<steps;++step){if(engine=="pds"){resident_pds_batch<<<slots,1>>>(graph.view(),layers,static_cast<int>(pds_width),current.get(),best.get(),cur_counts.get(),best_counts.get(),scratch_coords.get(),scratch.get(),cur.get(),best_obj.get(),rng.get(),lineage.get());cuda_check(cudaGetLastError(),"resident PDS atomic batch");}else if(engine=="flashsa"){flashsa_exact_step<<<(slots+127)/128,128>>>(graph.view(),static_cast<int>(slots),layers,current.get(),best.get(),cur_counts.get(),best_counts.get(),scratch.get(),cur.get(),best_obj.get(),rng.get(),lineage.get());cuda_check(cudaGetLastError(),"FlashSA exact step");}else{resident_step<<<(slots+127)/128,128>>>(graph.view(),static_cast<int>(slots),layers,current.get(),best.get(),cur_counts.get(),best_counts.get(),scratch.get(),cur.get(),best_obj.get(),rng.get(),lineage.get());cuda_check(cudaGetLastError(),"resident qualified step");if(engine=="pts"&&slots>1){const auto exchange_pairs=(slots-static_cast<std::uint64_t>(step&1U))/2U;if(exchange_pairs){resident_exchange<<<(exchange_pairs+127)/128,128>>>(static_cast<int>(slots),graph.node_count(),graph.edge_count(),current.get(),cur_counts.get(),cur.get(),lineage.get(),static_cast<int>(step&1));cuda_check(cudaGetLastError(),"resident adjacent exchange");}++out.exchanges;}}}cuda_check(cudaEventRecord(stop),"stop resident timer");cuda_check(cudaEventSynchronize(stop),"synchronize resident timer");cuda_check(cudaEventElapsedTime(&out.timed_ms,start,stop),"read resident timer");cudaEventDestroy(start);cudaEventDestroy(stop);out.temperatures.resize(slots);temperature.download(out.temperatures.data(),out.temperatures.size());
-    resident_choose<<<1,1>>>(static_cast<int>(slots),best_obj.get(),winner.get());cuda_check(cudaGetLastError(),"resident winner selection");cuda_check(cudaDeviceSynchronize(),"resident timed loop completion"); int w=0;winner.download(&w,1);DeviceObjective raw{};DeviceBuffer<DeviceObjective> selected(1);cuda_check(cudaMemcpy(selected.get(),best_obj.get()+w,sizeof(DeviceObjective),cudaMemcpyDeviceToDevice),"D2D selected objective");selected.download(&raw,1);out.score.status=static_cast<ProposalStatus>(raw.status);out.score.valid=raw.valid;out.score.exact_valid=raw.exact_valid;out.score.K=raw.K;out.score.nK=raw.nK;out.score.Phi=raw.Phi;out.score.C=raw.C;out.score.fallback_required=raw.fallback_reason==static_cast<int>(FallbackReason::overflow);out.score.fallback_reason=out.score.fallback_required?"overflow":"none";out.score.edge_crossings.resize(graph.edge_count());if(graph.edge_count())cuda_check(cudaMemcpy(out.score.edge_crossings.data(),best_counts.get()+w*graph.edge_count(),graph.edge_count()*sizeof(long long),cudaMemcpyDeviceToHost),"final exact count download");std::vector<long long> xy(2*graph.node_count());if(!xy.empty())cuda_check(cudaMemcpy(xy.data(),best.get()+2*w*graph.node_count(),xy.size()*sizeof(long long),cudaMemcpyDeviceToHost),"final coordinate download");for(int i=0;i<graph.node_count();++i)out.coordinates.emplace_back(xy[i],xy[graph.node_count()+i]);out.final_bytes=sizeof(int)+sizeof(DeviceObjective)+xy.size()*sizeof(long long)+out.score.edge_crossings.size()*sizeof(long long)+out.temperatures.size()*sizeof(double);return out;
-}
-
 } // namespace
 
-// This is intentionally a narrow release facade. It has no dependency on PTS
-// from PDS (or the reverse); shared behaviour is limited to the oracle ABI and
-// explicit telemetry schema.
+// Dedicated FMMM release API registration.
+// All legacy simulated annealing / PTS / PDS search engines have been cleanly excised,
+// leaving an uncluttered registration boundary specifically for multilevel layout.
 void register_resident_api(py::module_& module) {
-    module.def("workspace_estimate", [](std::uint64_t nodes, std::uint64_t edges, std::uint64_t groups, std::uint64_t max_bytes) {
-        if (groups == 0) throw py::value_error("groups must be positive");
-        const auto estimate = estimate_workspace(nodes, edges, groups);
-        if (estimate.total > max_bytes) throw py::value_error("workspace allocation guard: exact byte estimate exceeds max_bytes");
-        return estimate_dict(estimate);
-    }, py::arg("nodes"), py::arg("edges"), py::arg("groups"), py::kw_only(), py::arg("max_bytes"));
-
-    module.def("clone_workspace_state", [](const py::iterable& groups) {
-        // py::deepcopy is deliberate: this contract represents a complete D2D
-        // clone boundary and prevents aliasing between source and destination
-        // diagnostics without exposing unbounded device state to Python.
-        py::object deepcopy = py::module_::import("copy").attr("deepcopy");
-        py::list clone;
-        for (const py::handle group : groups) clone.append(deepcopy(group));
-        return clone;
-    }, py::arg("groups"));
-
-    module.def("workspace_device_clone_probe", [](std::uint64_t nodes, std::uint64_t edges, std::uint64_t groups, std::uint64_t max_bytes) {
-        const auto estimate=estimate_workspace(nodes,edges,groups); if(groups==0||estimate.total>max_bytes) throw py::value_error("workspace allocation guard: exact byte estimate exceeds max_bytes");
-        DeviceBuffer<unsigned char> source(static_cast<size_t>(estimate.total)), destination(static_cast<size_t>(estimate.total)); std::vector<unsigned char> pattern(static_cast<size_t>(estimate.total));for(size_t i=0;i<pattern.size();++i)pattern[i]=static_cast<unsigned char>((i*131U+17U)&0xffU);source.upload(pattern.data(),pattern.size());cuda_check(cudaMemcpy(destination.get(),source.get(),estimate.total,cudaMemcpyDeviceToDevice),"workspace full-state D2D clone");DeviceBuffer<unsigned long long> source_hash(1),destination_hash(1);workspace_digest<<<1,1>>>(source.get(),estimate.total,source_hash.get());workspace_digest<<<1,1>>>(destination.get(),estimate.total,destination_hash.get());cuda_check(cudaGetLastError(),"workspace clone digest");cuda_check(cudaDeviceSynchronize(),"workspace clone digest");unsigned long long a=0,b=0;source_hash.download(&a,1);destination_hash.download(&b,1);py::dict out=estimate_dict(estimate);out["clone_transport"]="D2D";out["d2d_bytes"]=estimate.total;out["source_digest"]=a;out["destination_digest"]=b;out["complete_state_match"]=(a==b);return out;
-    }, py::arg("nodes"),py::arg("edges"),py::arg("groups"),py::kw_only(),py::arg("max_bytes"));
-
-    module.def("workspace_typed_clone_probe", [](std::uint64_t nodes, std::uint64_t edges, std::uint64_t groups, std::uint64_t max_bytes) {
-        const auto estimate=estimate_workspace(nodes,edges,groups);if(groups==0||estimate.total>max_bytes)throw py::value_error("workspace allocation guard: exact byte estimate exceeds max_bytes");
-        const size_t coord=static_cast<size_t>(2*nodes*groups),count=static_cast<size_t>(edges*groups);DeviceBuffer<long long> current(coord),best(coord),scratch(coord),counts(count),count_best(count),count_scratch(count),clone_current(coord),clone_best(coord),clone_scratch(coord),clone_counts(count),clone_count_best(count),clone_count_scratch(count);DeviceBuffer<DeviceObjective> objective(groups),best_objective(groups),clone_objective(groups),clone_best_objective(groups);DeviceBuffer<unsigned long long> rng(groups),lineage(groups),clone_rng(groups),clone_lineage(groups);DeviceBuffer<double> temperature(groups),clone_temperature(groups);
-        std::vector<long long> coords(coord),crossings(count);std::vector<DeviceObjective> objectives(groups);std::vector<unsigned long long> rng_host(groups),lineage_host(groups);std::vector<double> temperature_host(groups);for(size_t group=0;group<groups;++group){for(size_t i=0;i<2*nodes;++i)coords[group*2*nodes+i]=static_cast<long long>(group*1000+i);for(size_t i=0;i<edges;++i)crossings[group*edges+i]=static_cast<long long>(group*100+i);objectives[group]={static_cast<long long>(group),1,2,3,1,1,static_cast<int>(ProposalStatus::accepted),0};rng_host[group]=10000+group;lineage_host[group]=20000+group;temperature_host[group]=1.0+0.25*static_cast<double>(group);}current.upload(coords.data(),coord);best.upload(coords.data(),coord);scratch.upload(coords.data(),coord);counts.upload(crossings.data(),count);count_best.upload(crossings.data(),count);count_scratch.upload(crossings.data(),count);objective.upload(objectives.data(),groups);best_objective.upload(objectives.data(),groups);rng.upload(rng_host.data(),groups);lineage.upload(lineage_host.data(),groups);temperature.upload(temperature_host.data(),groups);
-        auto d2d=[](void* dst,const void* src,size_t bytes){if(bytes)cuda_check(cudaMemcpy(dst,src,bytes,cudaMemcpyDeviceToDevice),"typed workspace D2D clone");};d2d(clone_current.get(),current.get(),coord*sizeof(long long));d2d(clone_best.get(),best.get(),coord*sizeof(long long));d2d(clone_scratch.get(),scratch.get(),coord*sizeof(long long));d2d(clone_counts.get(),counts.get(),count*sizeof(long long));d2d(clone_count_best.get(),count_best.get(),count*sizeof(long long));d2d(clone_count_scratch.get(),count_scratch.get(),count*sizeof(long long));d2d(clone_objective.get(),objective.get(),groups*sizeof(DeviceObjective));d2d(clone_best_objective.get(),best_objective.get(),groups*sizeof(DeviceObjective));d2d(clone_rng.get(),rng.get(),groups*sizeof(unsigned long long));d2d(clone_lineage.get(),lineage.get(),groups*sizeof(unsigned long long));d2d(clone_temperature.get(),temperature.get(),groups*sizeof(double));cuda_check(cudaDeviceSynchronize(),"typed workspace clone completion");
-        auto digest=[](const void* bytes,size_t count_bytes){DeviceBuffer<unsigned long long> hash(1);workspace_digest<<<1,1>>>(static_cast<const unsigned char*>(bytes),count_bytes,hash.get());cuda_check(cudaGetLastError(),"typed workspace digest");cuda_check(cudaDeviceSynchronize(),"typed workspace digest");unsigned long long value=0;hash.download(&value,1);return value;};
-        auto aggregate_digest=[&](bool clone){unsigned long long value=1469598103934665603ULL;auto mix=[&](const void* bytes,size_t count_bytes){value^=digest(bytes,count_bytes);value*=1099511628211ULL;};mix(clone?clone_current.get():current.get(),coord*sizeof(long long));mix(clone?clone_best.get():best.get(),coord*sizeof(long long));mix(clone?clone_scratch.get():scratch.get(),coord*sizeof(long long));mix(clone?clone_counts.get():counts.get(),count*sizeof(long long));mix(clone?clone_count_best.get():count_best.get(),count*sizeof(long long));mix(clone?clone_count_scratch.get():count_scratch.get(),count*sizeof(long long));mix(clone?clone_objective.get():objective.get(),groups*sizeof(DeviceObjective));mix(clone?clone_best_objective.get():best_objective.get(),groups*sizeof(DeviceObjective));mix(clone?clone_rng.get():rng.get(),groups*sizeof(unsigned long long));mix(clone?clone_lineage.get():lineage.get(),groups*sizeof(unsigned long long));mix(clone?clone_temperature.get():temperature.get(),groups*sizeof(double));return value;};
-        const auto source_state_digest=aggregate_digest(false),clone_state_digest=aggregate_digest(true);
-        std::vector<unsigned long long> clone_rng_host(groups),clone_lineage_host(groups);std::vector<double> clone_temperature_host(groups);std::vector<DeviceObjective> clone_objectives(groups);clone_rng.download(clone_rng_host.data(),groups);clone_lineage.download(clone_lineage_host.data(),groups);clone_temperature.download(clone_temperature_host.data(),groups);clone_objective.download(clone_objectives.data(),groups);py::dict out=estimate_dict(estimate);out["clone_transport"]="D2D";out["typed_state_bytes"]=estimate.total;out["source_state_digest"]=source_state_digest;out["clone_state_digest"]=clone_state_digest;out["rng"] = clone_rng_host;out["lineage"] = clone_lineage_host;out["temperature"] = clone_temperature_host;py::list objective_k;for(const auto& item:clone_objectives)objective_k.append(item.K);out["objective_K"] = objective_k;out["complete_state_match"]=(source_state_digest==clone_state_digest&&clone_rng_host==rng_host&&clone_lineage_host==lineage_host&&clone_temperature_host==temperature_host);return out;
-    },py::arg("nodes"),py::arg("edges"),py::arg("groups"),py::kw_only(),py::arg("max_bytes"));
-
-    module.def("pts_exchange", [](py::list slots, std::uint64_t parity) {
-        // Contract-only inspection snapshot.  Exchange moves exactly the
-        // current state; temperature/RNG/protected best remain bound to slot.
-        py::object deepcopy = py::module_::import("copy").attr("deepcopy");
-        py::list out = py::cast<py::list>(deepcopy(slots));
-        const py::ssize_t start = static_cast<py::ssize_t>(parity & 1U);
-        for (py::ssize_t i = start; i + 1 < py::len(out); i += 2) {
-            py::dict left = py::reinterpret_borrow<py::dict>(out[i]);
-            py::dict right = py::reinterpret_borrow<py::dict>(out[i + 1]);
-            for (const char* key : {"current_coordinates", "current_counts", "current_objective", "lineage"}) {
-                py::object tmp = left[key]; left[key] = right[key]; right[key] = tmp;
-            }
-        }
-        return out;
-    }, py::arg("slots"), py::kw_only(), py::arg("parity") = 0);
-
-    module.def("pds_rank_and_filter", [](const py::iterable& candidates) {
-        struct Candidate { py::dict value; std::int64_t index; std::vector<std::int64_t> touched; };
-        std::vector<Candidate> all;
-        for (const py::handle raw : candidates) {
-            py::dict value = py::reinterpret_borrow<py::dict>(raw);
-            Candidate item{value, py::cast<std::int64_t>(value["index"]), {}};
-            for (const py::handle n : py::reinterpret_borrow<py::iterable>(value["touched_nodes"])) item.touched.push_back(py::cast<std::int64_t>(n));
-            std::sort(item.touched.begin(), item.touched.end()); item.touched.erase(std::unique(item.touched.begin(), item.touched.end()), item.touched.end());
-            all.push_back(std::move(item));
-        }
-        std::sort(all.begin(), all.end(), [](const Candidate& a, const Candidate& b) { return objective_less(a.value, b.value) || (!objective_less(b.value, a.value) && a.index < b.index); });
-        std::vector<std::int64_t> claimed; py::list accepted, rejected, rank_order;
-        for (const auto& item : all) {
-            rank_order.append(item.value);
-            std::vector<std::int64_t> overlap;
-            std::set_intersection(item.touched.begin(), item.touched.end(), claimed.begin(), claimed.end(), std::back_inserter(overlap));
-            if (overlap.empty()) { accepted.append(item.value); claimed.insert(claimed.end(), item.touched.begin(), item.touched.end()); std::sort(claimed.begin(), claimed.end()); }
-            else rejected.append(item.value);
-        }
-        py::dict out; out["accepted"] = accepted; out["conflict_rejected"] = rejected; out["rank_order"] = rank_order; return out;
-    }, py::arg("candidates"));
-
     module.def("fmmm_seed", [](const py::iterable& nodes, const py::iterable& edges, std::int64_t width, std::int64_t height,
                                  std::uint64_t seed, const std::string& config, int iterations, bool layers_enabled,
                                  bool retain_device, bool time_exclude_score,
@@ -2407,31 +2186,6 @@ void register_resident_api(py::module_& module) {
         return fmmm_run_batch(layouts, edges, width, height, seed, config, iterations,
                               layers_enabled);
     }, py::arg("layouts"), py::arg("edges"), py::kw_only(), py::arg("max_width"), py::arg("max_height"), py::arg("seed"), py::arg("config") = kFmmmReferenceProfile, py::arg("iterations") = 0, py::arg("layers_enabled") = true);
-
-    module.def("flashsa_supported_modes", [] { return std::vector<std::string>{"FULL_SQUARE_GPU"}; });
-
-    module.def("run_qualified_engine", [](const std::string& engine, const py::iterable& nodes, const py::iterable& edges,
-                                             std::int64_t width, std::int64_t height, std::uint64_t seed,
-                                             const py::dict& config, bool layers_enabled) {
-        if (engine != "pts" && engine != "pds" && engine != "flashsa") throw py::value_error("engine must be pts, pds, or flashsa");
-        if (engine == "flashsa" && config.contains("evaluator_mode") && py::cast<std::string>(config["evaluator_mode"]) != "FULL_SQUARE_GPU") throw py::value_error("FlashSA supports only FULL_SQUARE_GPU");
-        const std::uint64_t slots = config.contains("replicas") ? py::cast<std::uint64_t>(config["replicas"]) : (config.contains("groups") ? py::cast<std::uint64_t>(config["groups"]) : 1U);
-        const std::uint64_t steps = config.contains("iterations") ? py::cast<std::uint64_t>(config["iterations"]) : 0U;
-        const std::uint64_t pds_width = config.contains("candidates") ? py::cast<std::uint64_t>(config["candidates"]) : 8U;
-        if (pds_width == 0 || pds_width > 32) throw py::value_error("PDS candidates must be in 1..32");
-        const ResidentRun run = execute_resident(parse_graph(nodes, edges, width, height), engine, seed, slots, steps, pds_width, layers_enabled);
-        py::dict telemetry;
-        telemetry["timed_full_population_h2d_bytes"] = 0;
-        telemetry["timed_full_population_d2h_bytes"] = 0;
-        telemetry["timed_host_decisions"] = 0;
-        telemetry["final_result_d2h_bytes"] = run.final_bytes;
-        telemetry["timed_region"] = "resident_device_search";
-        telemetry["device_adjacent_exchanges"] = run.exchanges;
-        telemetry["timed_elapsed_ms"] = run.timed_ms;
-        py::dict out; out["engine"] = engine; out["config"] = config; out["seed"] = seed; out["gpu"] = gpu_identity();
-        out["validity"] = run.score.valid; out["objective"] = score_dict(run.score); out["coordinates"] = run.coordinates; out["slot_temperatures"] = run.temperatures; out["evaluator"] = "FULL_SQUARE_GPU";
-        out["input_provenance"] = "caller-provided"; out["telemetry"] = telemetry; return out;
-    }, py::arg("engine"), py::arg("nodes"), py::arg("edges"), py::kw_only(), py::arg("max_width"), py::arg("max_height"), py::arg("seed"), py::arg("config") = py::dict(), py::arg("layers_enabled") = true);
 
     module.def("fmmm_finalize_ogdf_profile", [](const py::iterable& nodes, const py::iterable& edges,
                                                 const py::iterable& raw_x_it, const py::iterable& raw_y_it,

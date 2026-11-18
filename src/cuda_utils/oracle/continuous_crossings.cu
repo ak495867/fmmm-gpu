@@ -153,6 +153,13 @@ __global__ void continuous_cross_fp32_kernel(
             mark_invalid(state);
             continue;
         }
+        // Quick bounding-box cull: if the 2D bounding boxes do not overlap,
+        // these segments can never intersect. A couple of fmin/fmax comparisons
+        // save four determinant evaluations and spare the arithmetic units.
+        if (fmaxf(iax, ibx) < fminf(jax, jbx) || fmaxf(jax, jbx) < fminf(iax, ibx) ||
+            fmaxf(iay, iby) < fminf(jay, jby) || fmaxf(jay, jby) < fminf(iay, iby)) {
+            continue;
+        }
         const int s1 = sign_f(orient_f(iax, iay, ibx, iby, jax, jay));
         const int s2 = sign_f(orient_f(iax, iay, ibx, iby, jbx, jby));
         const int s3 = sign_f(orient_f(jax, jay, jbx, jby, iax, iay));
@@ -194,6 +201,12 @@ __global__ void continuous_cross_device_kernel(
             mark_invalid(state);
             continue;
         }
+        // Early AABB rejection: if bounding boxes are disjoint, proper crossing
+        // is geometrically impossible. Bypasses four orient_d evaluations.
+        if (fmax(iax, ibx) < fmin(jax, jbx) || fmax(jax, jbx) < fmin(iax, ibx) ||
+            fmax(iay, iby) < fmin(jay, jby) || fmax(jay, jby) < fmin(iay, iby)) {
+            continue;
+        }
         const int s1 = sign_d(orient_d(iax, iay, ibx, iby, jax, jay));
         const int s2 = sign_d(orient_d(iax, iay, ibx, iby, jbx, jby));
         const int s3 = sign_d(orient_d(jax, jay, jbx, jby, iax, iay));
@@ -228,6 +241,12 @@ __global__ void continuous_cross_legacy_kernel(
         const double jax = x[ja], jay = y[ja], jbx = x[jb], jby = y[jb];
         if (!isfinite(iax) || !isfinite(iay) || !isfinite(ibx) || !isfinite(iby) ||
             !isfinite(jax) || !isfinite(jay) || !isfinite(jbx) || !isfinite(jby)) continue;
+        // Bounding-box pruning keeps the legacy crossing count aligned with
+        // the accelerated path while filtering non-intersecting candidate pairs.
+        if (fmax(iax, ibx) < fmin(jax, jbx) || fmax(jax, jbx) < fmin(iax, ibx) ||
+            fmax(iay, iby) < fmin(jay, jby) || fmax(jay, jby) < fmin(iay, iby)) {
+            continue;
+        }
         const int s1 = sign_d(orient_d(iax, iay, ibx, iby, jax, jay));
         const int s2 = sign_d(orient_d(iax, iay, ibx, iby, jbx, jby));
         const int s3 = sign_d(orient_d(jax, jay, jbx, jby, iax, iay));

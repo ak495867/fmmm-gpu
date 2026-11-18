@@ -211,3 +211,15 @@ PYBIND11_MODULE(planar_cuda_refactored, m) {
     register_resident_api(m);
 #endif
 }
+
+// Dual entry point export: lets the extension load under its clean standalone name
+// `_fmmm_cuda` or its legacy ABI name `planar_cuda_refactored` without two separate builds.
+#if defined(_WIN32)
+#  define FMMM_EXPORT __declspec(dllexport)
+#else
+#  define FMMM_EXPORT __attribute__((visibility("default")))
+#endif
+
+extern "C" FMMM_EXPORT PyObject* PyInit__fmmm_cuda(void) {
+    return PyInit_planar_cuda_refactored();
+}

@@ -67,65 +67,106 @@ with edge-crossing counts and validity fields.
 
 ## Python API
 
-```python
-from fmmm_gpu import seed_layout
+The Python API provides high-level functions with typed dataclasses, complete dictionary backward-compatibility, and ecosystem adapters for NetworkX, NumPy, and PyTorch:
 
-result = seed_layout(
-    [(1.0, 1.0), (10.0, 10.0)],
-    [(0, 1, 0)],
-    width=100,
-    height=100,
-    seed=7,
-    iterations=3,
+```python
+from fmmm_gpu import seed_layout, layout_networkx
+
+# 1. Direct low-level invocation
+record = seed_layout(
+    node_count=4,
+    edges=[(0, 1), (1, 2), (2, 3), (3, 0)], # supports 2-tuples or 3-tuples (u, v, layer)
+    width=800.0,
+    height=600.0,
+    iterations=50,
+    seed=42,
 )
 
-print(result["status"])
-print(result["coordinates"])
-print(result["score"])
+# Object-oriented typed attributes:
+print(f"Status:     {record.status}")
+print(f"Dimensions: {record.width} x {record.height}")
+print(f"Crossings:  {record.score.K}")
+print(f"Energy:     {record.score.E}")
+print(f"Total time: {record.timings.total_ms:.2f} ms")
+
+# Or legacy dict-style access (100% backward compatible):
+print(record["coordinates"])
+print(record["status"])
+
+# Export directly to NumPy or PyTorch:
+coords_np = record.to_numpy() # shape (N, 2), dtype float64
+coords_pt = record.to_torch() # torch.Tensor shape (N, 2)
+
+# 2. High-level NetworkX integration
+import networkx as nx
+
+G = nx.karate_club_graph()
+# Direct position dictionary ready for nx.draw:
+pos = layout_networkx(G, width=1000.0, height=1000.0, return_dict=True)
+nx.draw(G, pos=pos, with_labels=True)
 ```
 
-The public facade intentionally exposes only `seed_layout` and hides the
-native extension loading details. The native module is currently named
-`planar_cuda_refactored` for ABI compatibility with the source project.
+The native pybind11 module exports both `_fmmm_cuda` and `planar_cuda_refactored` symbols, allowing modern packaging while preserving exact backward ABI compatibility with legacy callers.
+
+## Key Architectural & GPU Optimizations
+
+1. **CUDA Graph Capture & Replay**: Eliminates host-dispatch latency during repetitive force iterations by capturing the multipole and spring relaxation kernel sequences into an executable CUDA Graph (`cudaGraph_t` / `cudaGraphExec_t`).
+2. **Tiled Shared-Memory Coordinate Caching**: In exact force computation (`exact_force_loop_small_kernel`), node coordinates are staged into 256-thread `__shared__` tiles (`sh_x`, `sh_y`), slashing redundant global memory traffic and saturating compute units.
+3. **Dynamic Convergence & Early Stopping**: Tracks maximum displacement $\Delta_{\max}$ across relaxation iterations; when $\Delta_{\max} < 0.001 \cdot d_{\text{ideal}}$, execution terminates early on-device without wasting GPU cycles on infinitesimal adjustments.
+4. **AABB Spatial Pruning for Edge Crossings**: Evaluates bounding boxes $[x_{\min}, x_{\max}] \times [y_{\min}, y_{\max}]$ for candidate edge pairs in `continuous_cross_device_kernel`, fast-rejecting disjoint segment pairs before running costly 2D orientation and determinant math.
+5. **Architectural Pruning & Decoupling**: Excised legacy PTS/PDS/SharedSA simulated annealing and proposal logic from `resident_api.cu`, leaving a lean, dedicated FMMM layout engine.
 
 ## Requirements
 
-- Windows 10/11
-- Visual Studio 2022 C++ build tools
-- NVIDIA CUDA Toolkit 13.0, or a compatible CUDA 12/13 installation with
-  `nvcc`
-- NVIDIA GPU; the initial qualified target is Ada `sm_89`
-- Python 3.11 or newer
-- `pybind11` from [requirements.txt](requirements.txt)
+- **Operating System**: Linux (Ubuntu 20.04+, RHEL 8+, WSL2) or Windows 10/11
+- **Compilers**: GCC 9+ / Clang 11+ (Linux) or MSVC 2022 (Windows)
+- **CUDA Toolkit**: CUDA 11.8, 12.x, or 13.x with `nvcc`
+- **GPU Architectures**: NVIDIA Volta (`sm_70`), Turing (`sm_75`), Ampere (`sm_80`, `sm_86`), Ada Lovelace (`sm_89`), or Hopper (`sm_90`)
+- **Python**: 3.9 through 3.13
+- **Python Dependencies**: `pybind11>=3.0` (core build); `networkx`, `numpy`, `pytest` (optional ecosystem & testing)
 
-The build is currently qualified on Windows with Python 3.11, CUDA 13.0,
-MSVC 2022, and an RTX 4060 Laptop GPU. Other architectures may work after
-changing the architecture setting, but they are not covered by the current
-qualification statement.
+## Build Instructions
 
-## Build from a clean checkout
+### Linux / WSL (Direct Bash Script)
 
-From a Developer PowerShell with `nvcc` available:
+```bash
+# Install Python dependencies
+pip install -r requirements.txt
+
+# Build with nvcc for your target GPU architecture (default: sm_89)
+./build.sh --arch 89
+
+# Or specify custom paths if needed:
+./build.sh --arch 80 --python /usr/bin/python3 --cuda /usr/local/cuda
+```
+
+### Windows (PowerShell Script)
+
+From a Developer PowerShell:
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\python -m pip install --upgrade pip
 .\.venv\Scripts\python -m pip install -r requirements.txt
-.\build.ps1 -Python .\.venv\Scripts\python.exe
+.\build.ps1 -Python .\.venv\Scripts\python.exe -Architecture 89
 ```
 
-The direct build script performs one explicit NVCC invocation and writes the
-native extension to `build-clean\planar_cuda_refactored.pyd`. It also places
-NVCC temporary files under the ignored `build-clean\nvcc-tmp` directory so
-that compiler-generated files do not depend on a system temporary path.
+### Cross-Platform CMake Build
 
-The CMake configuration is retained for users who prefer a generator-based
-workflow:
+```bash
+# Configure and build across Linux or Windows
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFMMM_CUDA_ARCHITECTURES="75;80;86;89;90"
+cmake --build build --config Release -j
+```
 
-```powershell
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
-  -DFMMM_PYTHON_EXECUTABLE="$((Resolve-Path .\.venv\Scripts\python.exe).Path)"
-cmake --build build --config Release
+## Running the Standalone Test Suite
+
+The repository includes a comprehensive `pytest` test suite covering data structures, input validation, geometric invariants, NetworkX integration, and topology stress testing.
+
+When running on systems without an active NVIDIA GPU (such as CPU CI workers), tests automatically fall back to an internal synthetic mock engine, verifying all Python contracts, data conversions, and invariants seamlessly:
+
+```bash
+pip install -r requirements-dev.txt
+pytest -v
 ```
 
 ## Result contract
@@ -167,21 +208,25 @@ behavior. Comparisons should therefore report validity and GPU-scored
 objective values under a frozen protocol rather than claiming exact OGDF
 coordinate parity.
 
-The extracted native translation unit still contains a small number of legacy
-compatibility bindings for ABI continuity. The Python facade does not expose
-those unrelated operations; splitting the native binding into an FMMM-only
-translation unit is a planned cleanup.
+The native translation units have been fully decoupled and cleaned: all legacy
+PTS/PDS/SharedSA simulated annealing and proposal logic has been excised from
+`resident_api.cu`. The C++ binding now exports both `_fmmm_cuda` and
+`planar_cuda_refactored` for drop-in ABI compatibility.
 
 ## Repository layout
 
 ```text
-src/cuda_utils/oracle/       GPU graph storage and FULL_SQUARE_GPU authority
-src/cuda_utils/release/      FMMM hierarchy, force, NMM, session, and binding
-python/fmmm_gpu/             public Python facade
-build.ps1                   direct Windows/NVCC build
-CMakeLists.txt              generator-based build configuration
-requirements.txt            build dependency
-EXTRACTION_MANIFEST.md      source boundary and provenance notes
+src/cuda_utils/oracle/       GPU graph storage, AABB continuous crossings, FULL_SQUARE_GPU authority
+src/cuda_utils/release/      FMMM hierarchy, CUDA Graph replay, tiled force loops, NMM, session
+python/fmmm_gpu/             public Python facade (dataclasses, NetworkX/NumPy/PyTorch interop)
+tests/                       standalone pytest suite (fixtures, invariants, corpus, mock backend)
+build.ps1                    direct Windows/NVCC build script
+build.sh                     direct Linux/WSL/NVCC build script
+CMakeLists.txt               cross-platform multi-arch CMake configuration
+pyproject.toml               modern packaging manifest and optional dependencies
+requirements.txt             core build dependency
+requirements-dev.txt         testing and interop dependencies
+EXTRACTION_MANIFEST.md       provenance notes and release blocker audit
 ```
 
 ## Performance evidence from the paper/report

@@ -1,2 +1,8 @@
+# requirements-dev.txt - Development, testing, and ecosystem adapters
+#
+# Everything needed to run the standalone pytest suite and test conversions
+# against NetworkX, NumPy, and PyTorch.
 -r requirements.txt
 pytest>=8.0,<9.0
+networkx>=2.8
+numpy>=1.22

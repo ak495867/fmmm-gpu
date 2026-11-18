@@ -265,6 +265,13 @@ struct DeviceFmmmSession {
     std::uint64_t box_epoch = 0;
     std::uint64_t publication_epoch = 0;
 
+    // CUDA Graph handles for replaying the steady-state force schedule.
+    // When reuse is enabled, capturing the kernel sequence eliminates
+    // per-iteration host launch latency entirely.
+    cudaGraph_t schedule_graph = nullptr;
+    cudaGraphExec_t schedule_graph_exec = nullptr;
+    bool schedule_graph_captured = false;
+
     // One reusable timing set owned by the session.  The events are recorded
     // on the caller-provided session stream and are only waited on at the
     // publication boundary, after the single bounded final D2H is queued.

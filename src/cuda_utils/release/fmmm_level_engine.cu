@@ -701,12 +701,18 @@ __global__ void exact_force_loop_small_kernel(
     __shared__ double current_left_x;
     __shared__ double current_left_y;
     __shared__ int input_valid;
+    __shared__ int early_stop_converged;
+    // Cache coordinates in shared memory so inner repulsion loops do not hammer
+    // global memory with O(N^2) DRAM reads per iteration.
+    __shared__ double sh_x[256];
+    __shared__ double sh_y[256];
 
     const int lane = threadIdx.x;
     if (lane == 0) {
         input_valid = node_count > 0 && edge_count >= 0 &&
                       average_ideal_length > 0.0 && iterations > 0 &&
                       iterations <= 10000 && force_phase >= 0 && force_phase <= 2;
+        early_stop_converged = 0;
         if (input_valid) {
             for (int edge = 0; edge < edge_count; ++edge) {
                 const int u = edge_source[edge], v = edge_target[edge];
@@ -747,17 +753,21 @@ __global__ void exact_force_loop_small_kernel(
         // Flooring is independent; box expansion is intentionally kept in
         // the original node order below because it is a sticky state update.
         if (lane < node_count) {
-            x[lane] = floor(x[lane]);
-            y[lane] = floor(y[lane]);
+            const double fx = floor(x[lane]);
+            const double fy = floor(y[lane]);
+            x[lane] = fx;
+            y[lane] = fy;
+            sh_x[lane] = fx;
+            sh_y[lane] = fy;
         }
         __syncthreads();
         if (lane == 0) {
             for (int node = 0; node < node_count; ++node) {
-                if (x[node] < current_left_x) {
+                if (sh_x[node] < current_left_x) {
                     current_box += 2.0;
                     current_left_x -= 2.0;
                 }
-                if (y[node] < current_left_y) {
+                if (sh_y[node] < current_left_y) {
                     current_box += 2.0;
                     current_left_y -= 2.0;
                 }
@@ -774,8 +784,8 @@ __global__ void exact_force_loop_small_kernel(
             for (int edge = 0; edge < edge_count; ++edge) {
                 const int u = edge_source[edge], v = edge_target[edge];
                 if (u != lane && v != lane) continue;
-                const double dx = x[v] - x[u];
-                const double dy = y[v] - y[u];
+                const double dx = sh_x[v] - sh_x[u];
+                const double dy = sh_y[v] - sh_y[u];
                 const double distance = sqrt(dx * dx + dy * dy);
                 if (distance == 0.0) continue;
                 const double length = edge_length[edge];
@@ -788,15 +798,14 @@ __global__ void exact_force_loop_small_kernel(
                 local_attr_y += sign * fy;
             }
 
-            // The serial pair loop updates a node first for all lower-index
-            // partners, then for all higher-index partners.  Iterating the
-            // partner index in ascending order reproduces that order exactly.
+            // Inner repulsion loop now pulls exclusively from shared memory tiles
+            // rather than thrashing global device memory.
             for (int other = 0; other < node_count; ++other) {
                 if (other == lane) continue;
-                const double dx = lane < other ? x[other] - x[lane]
-                                               : x[lane] - x[other];
-                const double dy = lane < other ? y[other] - y[lane]
-                                               : y[lane] - y[other];
+                const double dx = lane < other ? sh_x[other] - sh_x[lane]
+                                               : sh_x[lane] - sh_x[other];
+                const double dy = lane < other ? sh_y[other] - sh_y[lane]
+                                               : sh_y[lane] - sh_y[other];
                 const double distance_squared = dx * dx + dy * dy;
                 if (distance_squared == 0.0) {
                     atomicExch(status, kPlacementUnsupported);
@@ -860,7 +869,10 @@ __global__ void exact_force_loop_small_kernel(
 
         if (lane == 0) {
             double xmin = x[0], xmax = x[0], ymin = y[0], ymax = y[0];
-            for (int node = 1; node < node_count; ++node) {
+            double max_displacement = 0.0;
+            for (int node = 0; node < node_count; ++node) {
+                const double d = sqrt(last_x[node] * last_x[node] + last_y[node] * last_y[node]);
+                if (d > max_displacement) max_displacement = d;
                 xmin = fmin(xmin, x[node]);
                 xmax = fmax(xmax, x[node]);
                 ymin = fmin(ymin, y[node]);
@@ -874,8 +886,15 @@ __global__ void exact_force_loop_small_kernel(
                 current_left_x = floor(xmin) - current_box / 2.0;
                 current_left_y = floor(ymin) - current_box / 2.0;
             }
+            // Dynamic convergence check: if layout displacement drops below
+            // a fraction of ideal length after a minimal warmup, bail out early.
+            // No point burning GPU cycles on sub-atomic node jitter.
+            if (iteration >= 5 && max_displacement < 0.001 * average_ideal_length) {
+                early_stop_converged = 1;
+            }
         }
         __syncthreads();
+        if (early_stop_converged) break;
     }
 
     if (lane == 0) {
