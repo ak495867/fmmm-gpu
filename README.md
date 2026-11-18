@@ -101,20 +101,40 @@ coords_pt = record.to_torch() # torch.Tensor shape (N, 2)
 import networkx as nx
 
 G = nx.karate_club_graph()
-# Direct position dictionary ready for nx.draw:
 pos = layout_networkx(G, width=1000.0, height=1000.0, return_dict=True)
 nx.draw(G, pos=pos, with_labels=True)
+
+# 3. High-throughput Batch Layout Engine
+from fmmm_gpu import seed_layout_batch
+
+batch_graphs = [(nx.cycle_graph(10), []), (nx.star_graph(15), [])]
+batch_records = seed_layout_batch(batch_graphs, width=800.0, height=800.0)
+
+# 4. PyTorch Geometric (PyG) Integration
+from fmmm_gpu import layout_pyg
+# data = layout_pyg(data)  # Populates data.pos directly on the target device!
+
+# 5. Progressive Streaming Animation
+from fmmm_gpu import stream_layout
+
+for snapshot in stream_layout(nodes=100, edges=edges, checkpoints=5):
+    # Yields progressive uncoarsening coordinates for live Jupyter/web rendering
+    pass
 ```
 
 The native pybind11 module exports both `_fmmm_cuda` and `planar_cuda_refactored` symbols, allowing modern packaging while preserving exact backward ABI compatibility with legacy callers.
 
 ## Key Architectural & GPU Optimizations
 
-1. **CUDA Graph Capture & Replay**: Eliminates host-dispatch latency during repetitive force iterations by capturing the multipole and spring relaxation kernel sequences into an executable CUDA Graph (`cudaGraph_t` / `cudaGraphExec_t`).
-2. **Tiled Shared-Memory Coordinate Caching**: In exact force computation (`exact_force_loop_small_kernel`), node coordinates are staged into 256-thread `__shared__` tiles (`sh_x`, `sh_y`), slashing redundant global memory traffic and saturating compute units.
-3. **Dynamic Convergence & Early Stopping**: Tracks maximum displacement $\Delta_{\max}$ across relaxation iterations; when $\Delta_{\max} < 0.001 \cdot d_{\text{ideal}}$, execution terminates early on-device without wasting GPU cycles on infinitesimal adjustments.
-4. **AABB Spatial Pruning for Edge Crossings**: Evaluates bounding boxes $[x_{\min}, x_{\max}] \times [y_{\min}, y_{\max}]$ for candidate edge pairs in `continuous_cross_device_kernel`, fast-rejecting disjoint segment pairs before running costly 2D orientation and determinant math.
-5. **Architectural Pruning & Decoupling**: Excised legacy PTS/PDS/SharedSA simulated annealing and proposal logic from `resident_api.cu`, leaving a lean, dedicated FMMM layout engine.
+1. **Scratch Arena Pooling (`FmmmDeviceArena`)**: Allocates scratch memory for multilevel coarsening once sized to the base fine graph ($N_0, E_0$), eliminating 150+ synchronous driver `cudaMalloc`/`cudaFree` roundtrips per layout run.
+2. **CUDA Graph Capture & Replay**: Eliminates host-dispatch latency during repetitive force iterations by capturing multipole and spring relaxation kernel sequences into an executable CUDA Graph (`cudaGraph_t` / `cudaGraphExec_t`).
+3. **Closed-Form $O(1)$ Continuous Crossing Inversion**: Replaced the per-warp binary search in `continuous_crossings.cu` with a closed-form quadratic triangular inversion, eliminating warp branch divergence across candidate edge pair evaluations.
+4. **Adaptive Barnes-Hut Opening Angle ($\theta$) Scheduling**: Dynamically schedules the multipole acceptance criterion ($\theta \approx 1.2$ during coarse tiers for rapid global clustering, tightening to $\theta \approx 0.6$ on fine tiers for geometric accuracy).
+5. **2D Guillotine Component Packing**: Decomposes disconnected graphs into independent connected components, relaxes each, and packs their bounding boxes into a balanced canvas using First-Fit Decreasing Height (FFDH) shelf packing.
+6. **Tiled Shared-Memory Coordinate Caching**: In exact force computation (`exact_force_loop_small_kernel`), node coordinates are staged into 256-thread `__shared__` tiles (`sh_x`, `sh_y`), slashing redundant global memory traffic and saturating compute units.
+7. **Dynamic Convergence & Early Stopping**: Tracks maximum displacement $\Delta_{\max}$ across relaxation iterations; when $\Delta_{\max} < 0.001 \cdot d_{\text{ideal}}$, execution terminates early on-device without wasting GPU cycles on infinitesimal adjustments.
+8. **AABB Spatial Pruning for Edge Crossings**: Evaluates bounding boxes $[x_{\min}, x_{\max}] \times [y_{\min}, y_{\max}]$ for candidate edge pairs in `continuous_cross_device_kernel`, fast-rejecting disjoint segment pairs before running costly 2D orientation and determinant math.
+9. **Architectural Pruning & Decoupling**: Excised legacy PTS/PDS/SharedSA simulated annealing and proposal logic from `resident_api.cu`, leaving a lean, dedicated FMMM layout engine.
 
 ## Requirements
 

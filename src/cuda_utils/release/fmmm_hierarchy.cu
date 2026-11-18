@@ -600,6 +600,29 @@ FmmmStageResult fmmm_build_hierarchy(FmmmHierarchyState& state,
     int  prev_edges   = graph.edge_count;
     auto cur_seed     = profile.seed;
 
+    // Pre-allocated scratch arena for coarsening stages.
+    // Multilevel hierarchy sizes decrease monotonically (N_{k+1} < N_k, E_{k+1} <= E_k),
+    // so sizing scratch buffers to the base fine graph (N_0, E_0) guarantees sufficient
+    // capacity for all coarse tiers while eliminating repetitive driver allocations.
+    const int max_scratch_n = std::max(graph.node_count, 1);
+    const int max_scratch_e = std::max(graph.edge_count, 1);
+
+    int*    d_scalars     = dev_alloc<int>(5); // status, coarse_n, coarse_e, high_e_span, draws
+    int*    d_parent      = dev_alloc<int>(max_scratch_n);
+    int*    d_type        = dev_alloc<int>(max_scratch_n);
+    int*    d_sun         = dev_alloc<int>(max_scratch_n);
+    double* d_dist        = dev_alloc<double>(max_scratch_n);
+    int*    d_csrc        = dev_alloc<int>(max_scratch_e);
+    int*    d_ctgt        = dev_alloc<int>(max_scratch_e);
+    double* d_clen        = dev_alloc<double>(max_scratch_e);
+    FmmmWorkspace ws      = make_ws(max_scratch_n, max_scratch_e);
+
+    int* d_status      = d_scalars;
+    int* d_coarse_n    = d_scalars + 1;
+    int* d_coarse_e    = d_scalars + 2;
+    int* d_high_e_span = d_scalars + 3;
+    int* d_draws       = d_scalars + 4;
+
     while (state.level_count < state.capacity) {
         const int k   = state.level_count - 1;
         auto& cur     = state.levels[k];
@@ -614,28 +637,8 @@ FmmmStageResult fmmm_build_hierarchy(FmmmHierarchyState& state,
 
         cur.prng_before = cur_seed;
 
-        // --- Temporary outputs for the coarsening kernel ---
-        int*    d_status      = dev_alloc<int>(1);
-        int*    d_coarse_n    = dev_alloc<int>(1);  // output: coarse node count
-        int*    d_coarse_e    = dev_alloc<int>(1);  // output: coarse edge count
-        int*    d_high_e_span = dev_alloc<int>(1);  // output: plan_high_edge_span
-        int*    d_draws       = dev_alloc<int>(1);  // solar PRNG draws consumed
-        // Separate arrays for the kernel's node-SoA outputs (not in plan pointers)
-        int*    d_parent      = dev_alloc<int>(ln);
-        int*    d_type        = dev_alloc<int>(ln);
-        int*    d_sun         = dev_alloc<int>(ln);
-        double* d_dist        = dev_alloc<double>(ln);
-        // Coarse edge arrays (needed for next level's lower_edge_*)
-        int*    d_csrc        = dev_alloc<int>(le1);
-        int*    d_ctgt        = dev_alloc<int>(le1);
-        double* d_clen        = dev_alloc<double>(le1);
-
-        FmmmWorkspace ws = make_ws(ln, le1);
-
-        // Launch the single-thread solar-hierarchy kernel.
+        // Launch the solar-hierarchy kernel.
         // Outputs written directly into cur.plan for adjacency/lambda/moon/high.
-        // d_type/d_sun/d_dist → will be copied to cur.plan lower node SoA below.
-        // d_high_e_span → output scalar; d_coarse_n/d_coarse_e → scalar counts.
         launch_full_path_solar_hierarchy_kernel(
             ln, le,
             cur.plan.lower_edge_source,
@@ -675,7 +678,6 @@ FmmmStageResult fmmm_build_hierarchy(FmmmHierarchyState& state,
         chk(cudaDeviceSynchronize(), "solar hierarchy kernel sync");
 
         // --- Copy the kernel's node-SoA outputs into cur.plan lower fields ---
-        // (Must happen before we free d_type/d_sun/d_dist)
         dev_d2d(d_type, const_cast<int*>(cur.plan.lower_type),                   ln);
         dev_d2d(d_sun,  const_cast<int*>(cur.plan.lower_dedicated_sun),           ln);
         dev_d2d(d_dist, const_cast<double*>(cur.plan.lower_dedicated_sun_distance), ln);
@@ -694,15 +696,8 @@ FmmmStageResult fmmm_build_hierarchy(FmmmHierarchyState& state,
                            cudaMemcpyDeviceToDevice), "solar draws D2D");
         }
 
-        dev_free(d_status); dev_free(d_coarse_n); dev_free(d_coarse_e);
-        dev_free(d_high_e_span); dev_free(d_draws);
-        // d_parent is a solar scratch ordinal map; high_lower_node already holds
-        // the published high→lower sun mapping for Advanced uncoarsen / AB.
-        dev_free(d_parent); dev_free(d_type); dev_free(d_sun); dev_free(d_dist);
-
         if (status_val != 0 || high_n <= 0) {
             // Kernel failed or graph is already minimal — stop coarsening.
-            dev_free(d_csrc); dev_free(d_ctgt); dev_free(d_clen);
             break;
         }
 
@@ -730,7 +725,20 @@ FmmmStageResult fmmm_build_hierarchy(FmmmHierarchyState& state,
         dev_d2d(d_ctgt, const_cast<int*>(nxt.plan.lower_edge_target), high_e);
         dev_d2d(d_clen, const_cast<double*>(nxt.plan.lower_edge_length), high_e);
 
-        dev_free(d_csrc); dev_free(d_ctgt); dev_free(d_clen);
+        prev_edges = high_e;
+        state.level_count++;
+    }
+
+    // Release pre-allocated scratch arena
+    dev_free(d_scalars);
+    dev_free(d_parent);
+    dev_free(d_type);
+    dev_free(d_sun);
+    dev_free(d_dist);
+    dev_free(d_csrc);
+    dev_free(d_ctgt);
+    dev_free(d_clen);
+    ws.release();
 
         prev_edges = high_e;
         state.level_count++;

@@ -1,5 +1,3 @@
-"""Small Python facade for the standalone CUDA FMMM seed engine."""
-
 from .api import (
     FmmmError,
     LayoutRecord,
@@ -7,7 +5,11 @@ from .api import (
     TimingBreakdown,
     capabilities,
     layout_networkx,
+    layout_pyg,
+    pack_components,
     seed_layout,
+    seed_layout_batch,
+    stream_layout,
 )
 
 __all__ = [
@@ -17,5 +19,9 @@ __all__ = [
     "TimingBreakdown",
     "capabilities",
     "layout_networkx",
+    "layout_pyg",
+    "pack_components",
     "seed_layout",
+    "seed_layout_batch",
+    "stream_layout",
 ]

@@ -412,7 +412,15 @@ void fmmm_bh_compute_repulsion(FmmmDeviceStateView state, FmmmBarnesHutConfig co
     if (state.force_x == nullptr || state.force_y == nullptr) throw std::invalid_argument("Barnes-Hut force buffers are required");
     summarize_tree<<<1, 1>>>(state, config.summarize_iterations);
     check(cudaGetLastError(), "launch explicit Barnes-Hut tree summary");
-    if (state.node_count > 0) compute_repulsion<<<(state.node_count + 127) / 128, 128>>>(state, config.theta);
+
+    // Adaptive MAC opening angle: when theta <= 0, scale dynamically based on node count.
+    // Coarse/large graphs use theta ~ 1.2 for fast global cluster separation;
+    // fine graphs tighten theta ~ 0.6 to minimize multipole approximation error.
+    const float effective_theta = (config.theta > 0.0F)
+        ? config.theta
+        : (state.node_count > 5000 ? 1.2F : (state.node_count > 1000 ? 0.85F : 0.6F));
+
+    if (state.node_count > 0) compute_repulsion<<<(state.node_count + 127) / 128, 128>>>(state, effective_theta);
     check(cudaGetLastError(), "launch explicit Barnes-Hut repulsion");
     if (state.node_count > 0 && state.edge_count > 0) {
         add_edge_attraction<<<(state.node_count + 127) / 128, 128>>>(state, config.attraction_weight);

@@ -26,15 +26,16 @@ __device__ inline std::uint64_t pair_row_start(std::uint64_t row,
 
 __device__ inline void pair_id_to_edges(std::uint64_t pair_id, int edge_count,
                                          int* first, int* second) {
-    std::uint64_t lo = 0;
-    std::uint64_t hi = static_cast<std::uint64_t>(edge_count - 1);
     const std::uint64_t edges = static_cast<std::uint64_t>(edge_count);
-    while (lo + 1 < hi) {
-        const std::uint64_t mid = lo + (hi - lo) / 2ULL;
-        if (pair_row_start(mid, edges) <= pair_id) lo = mid;
-        else hi = mid;
-    }
-    const std::uint64_t row = pair_row_start(hi, edges) <= pair_id ? hi : lo;
+    // Closed-form triangular inversion eliminates per-warp binary search divergence.
+    // Inverting row*(2E - row - 1)/2 <= pair_id via quadratic formula yields exact row index in O(1).
+    const double b = static_cast<double>(2ULL * edges - 1ULL);
+    const double disc = b * b - 8.0 * static_cast<double>(pair_id);
+    std::uint64_t row = (disc > 0.0) ? static_cast<std::uint64_t>(std::floor((b - std::sqrt(disc)) * 0.5)) : 0;
+    if (row >= edges) row = edges - 1;
+    while (row + 1 < edges && pair_row_start(row + 1, edges) <= pair_id) ++row;
+    while (row > 0 && pair_row_start(row, edges) > pair_id) --row;
+
     const std::uint64_t offset = pair_id - pair_row_start(row, edges);
     *first = static_cast<int>(row);
     *second = static_cast<int>(row + 1ULL + offset);
